@@ -8,23 +8,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/cache@v4
-        with:
-          path: app/libs/libbox.aar
-          key: libbox-v1.11.0-${{ runner.os }}
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - uses: actions/setup-go@v5
-        if: hashFiles('app/libs/libbox.aar') == ''
         with:
           go-version: '1.24'
 
       - uses: nttld/setup-ndk@v1
-        if: hashFiles('app/libs/libbox.aar') == ''
         id: setup-ndk
         with:
           ndk-version: r27
@@ -35,7 +28,6 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build libbox.aar
-        if: hashFiles('app/libs/libbox.aar') == ''
         run: |
           export ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
           export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
@@ -50,9 +42,10 @@ jobs:
           fi
           gomobile init || true
           if [ -d experimental/libbox ]; then LB=./experimental/libbox; else LB=./libbox; fi
-          gomobile bind -v -androidapi 21 -javapkg=io.nekohasekai -libname=box $LB
+          gomobile bind -v -androidapi 21 -javapkg=io.nekohasekai -libname=box -tags with_clash_api $LB
           mkdir -p ../app/libs
           cp "$(ls -1 *.aar | head -1)" ../app/libs/libbox.aar
+          ls -la ../app/libs
 
       - name: Build APK
         run: gradle assembleDebug --no-daemon --stacktrace
