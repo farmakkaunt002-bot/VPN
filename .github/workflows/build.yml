@@ -13,14 +13,30 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: Download libbox.aar
+      - name: Install NDK
         run: |
-          mkdir -p app/libs
-          curl -L -o app/libs/libbox.aar https://github.com/SagerNet/sing-box-for-android/releases/download/v1.11.0/libbox.aar
+          echo "y" | sudo /usr/local/lib/android/sdk/tools/bin/sdkmanager --install "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.0.12077973" >> $GITHUB_ENV
+
+      - name: Build libbox.aar from sing-box source
+        run: |
+          git clone --depth 1 -b v1.11.0 https://github.com/SagerNet/sing-box.git
+          cd sing-box
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          export PATH=$PATH:$(go env GOPATH)/bin
+          gomobile init
+          make lib_android
+          mkdir -p ../app/libs
+          cp libbox.aar ../app/libs/libbox.aar
 
       - name: Build APK
         run: gradle assembleDebug --no-daemon --stacktrace
