@@ -32,8 +32,8 @@ jobs:
           export ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
           git clone --depth 1 -b v1.11.0 https://github.com/SagerNet/sing-box.git
           cd sing-box
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go get -tool golang.org/x/mobile/cmd/gomobile@latest
+          go get -tool golang.org/x/mobile/cmd/gobind@latest
           export PATH=$PATH:$(go env GOPATH)/bin
           gomobile init
           gomobile bind -target=android -androidapi=21 -javapkg=io.nekohasekai.libbox ./libbox/
