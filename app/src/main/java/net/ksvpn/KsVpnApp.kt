@@ -1,21 +1,30 @@
 package net.ksvpn
 
+import android.Manifest
+import android.app.Activity
 import android.app.Application
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
+import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.Settings
 import android.util.Base64
 import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -27,10 +36,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationCompat
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import io.nekohasekai.libbox.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -43,14 +54,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import androidx.core.app.NotificationCompat
-import android.content.pm.ServiceInfo
-import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
-import kotlinx.coroutines.flow.MutableStateFlow
 
-// ========== App ==========
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -58,7 +62,6 @@ class App : Application() {
     }
 }
 
-// ========== Store ==========
 data class Profile(val tag: String, val name: String, val json: String)
 
 object Store {
@@ -92,7 +95,6 @@ object Store {
         }
 }
 
-// ========== Status ==========
 enum class Mode { IDLE, CONNECTING, CONNECTED, BLOCKED }
 
 object Status {
@@ -105,7 +107,6 @@ object Status {
     fun log(s: String) { lines.value = (lines.value + "${fmt.format(Date())} $s").takeLast(80) }
 }
 
-// ========== Lockdown ==========
 object Lockdown {
     fun alwaysOnApp(c: Context): String? =
         runCatching { Settings.Secure.getString(c.contentResolver, "always_on_vpn_app") }.getOrNull()
@@ -119,7 +120,6 @@ object Lockdown {
                     "adb shell settings put secure always_on_vpn_lockdown 1"
 }
 
-// ========== Links ==========
 object Links {
     fun b64(s: String): String {
         var t = s.trim().replace("\n", "").replace("\r", "").replace("\t", "").replace(" ", "")
@@ -288,7 +288,6 @@ object Links {
     }.getOrNull()
 }
 
-// ========== Sub ==========
 object Sub {
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -328,14 +327,13 @@ object Sub {
     }
 }
 
-// ========== Config ==========
 object Config {
     const val V4 = "172.19.0.1"
     const val V6 = "fdfe:dcba:9876::1"
     const val DNS_IN_TUN = "172.19.0.2"
     const val MTU = 1500
 
-    fun build(p: Profile): String {
+    fun build(p: Profile, cachePath: String): String {
         val proxy = JSONObject(p.json).put("tag", "proxy")
         val outbounds = JSONArray()
             .put(proxy)
@@ -362,13 +360,14 @@ object Config {
                     .put(JSONObject().put("ip_is_private", true).put("outbound", "direct")))
                 .put("final", "proxy")
                 .put("auto_detect_interface", false))
-            .put("experimental", JSONObject().put("cache_file", JSONObject().put("enabled", true)))
+            .put("experimental", JSONObject().put("cache_file", JSONObject()
+                .put("enabled", true).put("path", cachePath)))
             .toString()
     }
 }
 
-// ========== KsVpnService ==========
-class KsVpnService : VpnService() {
+class KsVpnService : VpnService(), PlatformInterface {
+
     companion object {
         const val START = "net.ksvpn.START"
         const val BLOCK = "net.ksvpn.BLOCK"
@@ -382,7 +381,7 @@ class KsVpnService : VpnService() {
         }
     }
 
-    private var box: Any? = null
+    private var box: BoxService? = null
     private var blackhole: ParcelFileDescriptor? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var watchdog: Job? = null
@@ -417,10 +416,13 @@ class KsVpnService : VpnService() {
 
         scope.launch {
             try {
-                val cfg = Config.build(p)
                 val dir = File(filesDir, "box").apply { mkdirs() }
-                val tmp = File(cacheDir, "tmp").apply { mkdirs() }
-                Status.log("конфигурация создана, запуск ядра...")
+                val cfg = Config.build(p, File(dir, "cache.db").absolutePath)
+                val s = Libbox.newService(cfg, this@KsVpnService)
+                s.start()
+                box = s
+                blackholeOff()
+                fails = 0
                 Status.set(Mode.CONNECTED, p.name); notifyUpdate()
                 startWatchdog()
             } catch (e: Exception) {
@@ -431,7 +433,7 @@ class KsVpnService : VpnService() {
         }
     }
 
-    private fun closeBox() { box = null }
+    private fun closeBox() { runCatching { box?.close() }; box = null }
 
     private fun blackholeOn() {
         try {
@@ -501,16 +503,48 @@ class KsVpnService : VpnService() {
         super.onDestroy()
     }
 
+    // ----- PlatformInterface (sing-box libbox) -----
+
+    override fun openTun(options: TunOptions): Int {
+        val b = Builder().setSession("KS VPN").setMtu(Config.MTU)
+            .addAddress(Config.V4, 30).addRoute("0.0.0.0", 0)
+            .addAddress(Config.V6, 126).addRoute("::", 0)
+            .addDnsServer(Config.DNS_IN_TUN)
+        if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
+        val pfd = b.establish() ?: throw IllegalStateException("VPN не разрешён")
+        return pfd.detachFd()
+    }
+
+    override fun usePlatformAutoDetectInterfaceControl() = true
+    override fun autoDetectInterfaceControl(fd: Int) { protect(fd) }
+    override fun useProcFS() = false
+    override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String, sourcePort: Int,
+                                     destinationAddress: String, destinationPort: Int) = -1
+    override fun writeLog(message: String) { Log.d("ksvpn", message); Status.log(message) }
+    override fun localDNSTransport(): LocalDNSTransport? = null
+    override fun underNetworkExtension() = false
+    override fun includeAllNetworks() = false
+    override fun clearDNSCache() {}
+    override fun readWIFIState(): WIFIState? = null
+    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
+    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
+    override fun getInterfaces(): NetworkInterfaceIterator = object : NetworkInterfaceIterator {
+        override fun hasNext() = false
+        override fun next(): NetworkInterface = throw NoSuchElementException()
+    }
+
+    // ----- уведомление -----
+
     private fun goForeground() {
-        val n = build()
+        val n = buildNotif()
         if (Build.VERSION.SDK_INT >= 34)
             startForeground(NOTIF, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(NOTIF, n)
     }
 
-    private fun notifyUpdate() = getSystemService(NotificationManager::class.java).notify(NOTIF, build())
+    private fun notifyUpdate() = getSystemService(NotificationManager::class.java).notify(NOTIF, buildNotif())
 
-    private fun build(): Notification {
+    private fun buildNotif(): Notification {
         val title = when (Status.mode.value) {
             Mode.CONNECTED -> "KS VPN: подключено"
             Mode.BLOCKED -> "KS VPN: интернет заблокирован"
@@ -533,7 +567,6 @@ class KsVpnService : VpnService() {
     }
 }
 
-// ========== MainActivity ==========
 class MainActivity : ComponentActivity() {
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -559,6 +592,9 @@ private fun Screen() {
 
     val vpn = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (it.resultCode == Activity.RESULT_OK) KsVpnService.start(ctx) else msg = "VPN не разрешён"
+    }
+    val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
+        r.contents?.let { url = it; Store.subUrl = it; msg = "QR распознан — нажми «Загрузить»" }
     }
     val perm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(Unit) {
@@ -626,6 +662,10 @@ private fun Screen() {
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { load() }, enabled = !busy) { Text(if (busy) "Загрузка…" else "Загрузить") }
+            OutlinedButton(onClick = {
+                scan.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                    .setPrompt("Наведите на QR подписки").setBeepEnabled(false).setOrientationLocked(false))
+            }) { Text("QR") }
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -654,7 +694,6 @@ private fun Screen() {
     }
 }
 
-// ========== BootReceiver ==========
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         Store.init(c)
