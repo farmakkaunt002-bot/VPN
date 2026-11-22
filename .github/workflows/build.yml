@@ -17,24 +17,26 @@ jobs:
         with:
           go-version: '1.22'
 
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27
+          add-to-path: true
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: Install NDK
+      - name: Build libbox.aar
         run: |
-          echo "y" | sudo /usr/local/lib/android/sdk/tools/bin/sdkmanager --install "ndk;27.0.12077973"
-          echo "ANDROID_NDK_HOME=/usr/local/lib/android/sdk/ndk/27.0.12077973" >> $GITHUB_ENV
-
-      - name: Build libbox.aar from sing-box source
-        run: |
+          export ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
           git clone --depth 1 -b v1.11.0 https://github.com/SagerNet/sing-box.git
           cd sing-box
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           export PATH=$PATH:$(go env GOPATH)/bin
           gomobile init
-          make lib_android
+          gomobile bind -target=android -androidapi=21 -javapkg=io.nekohasekai.libbox ./libbox/
           mkdir -p ../app/libs
           cp libbox.aar ../app/libs/libbox.aar
 
