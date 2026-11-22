@@ -47,6 +47,8 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.lang.reflect.InvocationHandler
+import java.lang.reflect.Proxy
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URLDecoder
@@ -366,7 +368,7 @@ object Config {
     }
 }
 
-class KsVpnService : VpnService(), PlatformInterface {
+class KsVpnService : VpnService() {
 
     companion object {
         const val START = "net.ksvpn.START"
@@ -418,7 +420,7 @@ class KsVpnService : VpnService(), PlatformInterface {
             try {
                 val dir = File(filesDir, "box").apply { mkdirs() }
                 val cfg = Config.build(p, File(dir, "cache.db").absolutePath)
-                val s = Libbox.newService(cfg, this@KsVpnService)
+                val s = Libbox.newService(cfg, platformInterface())
                 s.start()
                 box = s
                 blackholeOff()
@@ -503,9 +505,60 @@ class KsVpnService : VpnService(), PlatformInterface {
         super.onDestroy()
     }
 
-    // ----- PlatformInterface (sing-box libbox) -----
+    // ----- мост к ядру sing-box: динамический прокси интерфейса -----
+    // Компилятору не нужно знать список методов ядра — он разбирается на лету.
 
-    override fun openTun(options: TunOptions): Int {
+    private fun platformInterface(): PlatformInterface {
+        val handler = InvocationHandler { _, method, args ->
+            when (method.name) {
+                "openTun" -> openTunFd()
+                "autoDetectInterfaceControl" -> { protect((args!![0] as Number).toInt()); null }
+                "usePlatformAutoDetectInterfaceControl" -> true
+                "useProcFS" -> false
+                "underNetworkExtension" -> false
+                "includeAllNetworks" -> false
+                "writeLog" -> { Status.log("[box] " + (args?.get(0) as? String)); null }
+                "findConnectionOwner" -> -1
+                "getInterfaces" -> emptyIterator()
+                "toString" -> "KsPlatform"
+                "hashCode" -> System.identityHashCode(this)
+                "equals" -> false
+                else -> defaultFor(method.returnType)
+            }
+        }
+        return Proxy.newProxyInstance(
+            PlatformInterface::class.java.classLoader,
+            arrayOf(PlatformInterface::class.java),
+            handler
+        ) as PlatformInterface
+    }
+
+    private fun emptyIterator(): Any? {
+        val cls = NetworkInterfaceIterator::class.java
+        return Proxy.newProxyInstance(cls.classLoader, arrayOf(cls)) { _, m, _ ->
+            when (m.name) {
+                "hasNext" -> false
+                "toString" -> "empty"
+                "hashCode" -> 0
+                "equals" -> false
+                else -> null
+            }
+        }
+    }
+
+    private fun defaultFor(t: Class<*>): Any? = when (t) {
+        java.lang.Boolean.TYPE -> false
+        java.lang.Integer.TYPE -> 0
+        java.lang.Long.TYPE -> 0L
+        java.lang.Float.TYPE -> 0f
+        java.lang.Double.TYPE -> 0.0
+        java.lang.Short.TYPE -> 0.toShort()
+        java.lang.Byte.TYPE -> 0.toByte()
+        java.lang.Character.TYPE -> ' '
+        else -> null
+    }
+
+    private fun openTunFd(): Int {
         val b = Builder().setSession("KS VPN").setMtu(Config.MTU)
             .addAddress(Config.V4, 30).addRoute("0.0.0.0", 0)
             .addAddress(Config.V6, 126).addRoute("::", 0)
@@ -513,24 +566,6 @@ class KsVpnService : VpnService(), PlatformInterface {
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
         val pfd = b.establish() ?: throw IllegalStateException("VPN не разрешён")
         return pfd.detachFd()
-    }
-
-    override fun usePlatformAutoDetectInterfaceControl() = true
-    override fun autoDetectInterfaceControl(fd: Int) { protect(fd) }
-    override fun useProcFS() = false
-    override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String, sourcePort: Int,
-                                     destinationAddress: String, destinationPort: Int) = -1
-    override fun writeLog(message: String) { Log.d("ksvpn", message); Status.log(message) }
-    override fun localDNSTransport(): LocalDNSTransport? = null
-    override fun underNetworkExtension() = false
-    override fun includeAllNetworks() = false
-    override fun clearDNSCache() {}
-    override fun readWIFIState(): WIFIState? = null
-    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
-    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
-    override fun getInterfaces(): NetworkInterfaceIterator = object : NetworkInterfaceIterator {
-        override fun hasNext() = false
-        override fun next(): NetworkInterface = throw NoSuchElementException()
     }
 
     // ----- уведомление -----
@@ -663,8 +698,11 @@ private fun Screen() {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { load() }, enabled = !busy) { Text(if (busy) "Загрузка…" else "Загрузить") }
             OutlinedButton(onClick = {
-                scan.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                    .setPrompt("Наведите на QR подписки").setBeepEnabled(false).setOrientationLocked(false))
+                scan.launch(ScanOptions()
+                    .setDesiredBarcodeFormats(listOf(ScanOptions.QR_CODE))
+                    .setPrompt("Наведите на QR подписки")
+                    .setBeepEnabled(false)
+                    .setOrientationLocked(false))
             }) { Text("QR") }
         }
 
